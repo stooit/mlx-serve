@@ -37,6 +37,15 @@ pub fn priorCosts(plain_ms: f32) Costs {
     return out;
 }
 
+/// Round ms by verify rows where a row costs the same wherever it sits: `fixed_ms` the round pays whatever it verifies
+/// (its draft), `plain_ms` the one-row verify, `row_ms` each further row.
+pub fn linearCosts(fixed_ms: f32, plain_ms: f32, row_ms: f32) Costs {
+    var out: Costs = undefined;
+    out[0] = 0;
+    for (1..MAX_ROWS + 1) |r| out[r] = fixed_ms + plain_ms + row_ms * @as(f32, @floatFromInt(r - 1));
+    return out;
+}
+
 /// A plain round's ms when nothing has been measured yet.
 pub const PRIOR_PLAIN_MS: f32 = LADDER[0][1];
 
@@ -163,6 +172,8 @@ pub const Drafting = struct {
     /// Longest stretch of plain rounds between two probes.
     const MAX_PERIOD: u32 = 32;
     const ALPHA: f32 = 0.3;
+    /// Drafting within this share of paying for itself is narrowly losing.
+    const NEAR: f32 = 0.85;
 
     /// Averages over drafted rounds of the plain-round ms their tokens replaced and of the ms they took:
     /// the ratio weighs a round by its time, where a mean of per-round ratios swings on every short miss.
@@ -172,6 +183,12 @@ pub const Drafting = struct {
     owed: u32 = 0,
     /// Plain rounds the next losing round will owe.
     period: u32 = 1,
+    /// Longest stretch this request backs off for (`MAX_PERIOD` unless an experiment lowers it).
+    max_period: u32 = MAX_PERIOD,
+    /// Longest stretch while drafting is only narrowly losing (`NEAR` of what it costs): a drafted round that lands
+    /// one token in two still beats a plain one, and a long stretch after a short run of misses gives that up. A
+    /// stretch of misses with nothing landing falls under `NEAR` and backs off to `max_period`.
+    near_period: u32 = 2,
     /// Rounds skipped, for stats.
     skipped: u64 = 0,
     /// Drafted rounds that followed a skip stretch.
@@ -204,7 +221,7 @@ pub const Drafting = struct {
             self.period = @max(1, self.period / 2);
         } else {
             self.owed = self.period;
-            self.period = @min(self.period * 2, MAX_PERIOD);
+            self.period = @min(self.period * 2, if (self.gain >= NEAR * self.wall) @min(self.near_period, self.max_period) else self.max_period);
         }
     }
 };
@@ -261,23 +278,37 @@ pub fn chooseGroupRows(p: []const []const f32, costs: *const GroupCosts, drafts:
 /// being the group's plain step. Fitted on an M5 Ultra (`DSV41_GROUP`), scaled by what this machine's rounds took: slowly,
 /// and by at most a quarter per sample (`PlainCost`'s rule).
 pub const GroupCost = struct {
-    const BASE: f32 = 12;
-    const PER_STATE: f32 = 4.6;
-    const PER_ROW: f32 = 4.4;
-
+    /// The fit's terms; a module whose rounds price differently sets its own (`streamed`).
+    base: f32 = 12,
+    per_state: f32 = 4.6,
+    per_row: f32 = 4.4,
+    /// Rows one call of the module's batch carries, and what each further call of a round costs (0: one call).
+    call_rows: u32 = MAX_GROUP_ROWS,
+    per_call: f32 = 0,
     scale: f32 = 1,
 
-    fn prior(states: usize, rows: usize) f32 {
-        return BASE + PER_STATE * @as(f32, @floatFromInt(states)) + PER_ROW * @as(f32, @floatFromInt(rows -| states));
+    /// DeepSeek-V4.1 over a streamed EXL3 bank, every expert resident (M5 Ultra, measured in service, 2 to 4 states at
+    /// 6 to 16 rows): a row's six experts a layer are the cost (the coded experts cross the memory bus once a row), a
+    /// further state almost free, and rows past the bank's 8-row lane take a second source call a layer.
+    pub const streamed: GroupCost = .{ .base = 16, .per_state = 7.8, .per_row = 6.3, .call_rows = 8, .per_call = 9 };
+
+    fn prior(self: *const GroupCost, states: usize, rows: usize) f32 {
+        const calls: f32 = @floatFromInt((@max(rows, 1) - 1) / self.call_rows);
+        return self.base + self.per_state * @as(f32, @floatFromInt(states)) + self.per_row * @as(f32, @floatFromInt(rows -| states)) + self.per_call * calls;
     }
 
     pub fn ms(self: *const GroupCost, states: usize, rows: usize) f32 {
-        return self.scale * prior(states, rows);
+        return self.scale * self.prior(states, rows);
     }
 
     /// What one more verify row costs.
     pub fn rowMs(self: *const GroupCost) f32 {
-        return self.scale * PER_ROW;
+        return self.scale * self.per_row;
+    }
+
+    /// A further row's share of a lone state's one-row verify: what a solo round's ladder scales by its plain step.
+    pub fn rowShare(self: *const GroupCost) f32 {
+        return self.per_row / (self.base + self.per_state);
     }
 
     /// The verify's ms by rows for a group of `states` slots (index = rows, below `states` unused).
@@ -290,7 +321,7 @@ pub const GroupCost = struct {
     /// A verify of `rows` rows over `states` slots took `took` ms.
     pub fn sample(self: *GroupCost, states: usize, rows: usize, took: f32) void {
         if (!std.math.isFinite(took) or took <= 0) return;
-        const want = took / prior(states, rows);
+        const want = took / self.prior(states, rows);
         self.scale += 0.1 * (std.math.clamp(want, self.scale * 0.8, self.scale * 1.25) - self.scale);
     }
 };
@@ -557,7 +588,7 @@ test "chooseGroupRows: a poisoned probability is no acceptance, and the cut stay
 test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {
     var cost: GroupCost = .{};
     try testing.expect(cost.ms(2, 4) > cost.ms(2, 2) and cost.ms(3, 3) > cost.ms(2, 2));
-    for (0..200) |_| cost.sample(2, 4, 2 * GroupCost.prior(2, 4));
+    for (0..200) |_| cost.sample(2, 4, 2 * cost.prior(2, 4));
     try testing.expectApproxEqAbs(@as(f32, 2), cost.scale, 0.05);
     cost.sample(2, 4, std.math.nan(f32));
     cost.sample(2, 4, 1e9);
@@ -571,4 +602,13 @@ test "Calibration: a head prior reads the drafter's confidence as its acceptance
     try testing.expect(fitted.probability(0.93) < 0.7);
     for (0..60) |_| head.observe(0.93, false);
     try testing.expect(head.probability(0.93) < 0.2);
+}
+
+test "linearCosts: the fixed draft makes a doubtful row worth buying where the bare ladder declines it" {
+    const p = [_]f32{ 0.28, 0.9, 0.9 };
+    const bare = linearCosts(0, 24, 6.3);
+    const with_draft = linearCosts(6.5, 24, 6.3);
+    try std.testing.expectEqual(@as(u32, 1), chooseRows(&p, &bare).rows);
+    try std.testing.expect(chooseRows(&p, &with_draft).rows > 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.5 + 24 + 2 * 6.3), with_draft[3], 1e-3);
 }

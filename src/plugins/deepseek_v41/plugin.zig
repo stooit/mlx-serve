@@ -293,7 +293,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     // The worker's layers when the driver's load planned a Thunderbolt pair.
     const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
     m.s = s;
-    m.caps = config.runtimeCaps(c, ctx.parsed.caps, portableM2());
+    m.caps = config.runtimeCaps(c, ctx.parsed.caps, portableM2() or device.naxAvailable());
     m.aux_cache_budget_bytes = if (c.dsv41_exl3_bank and m.caps.active_slots > 0 and pair == null) ctx.auxCacheBudget() else 0;
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
@@ -423,7 +423,7 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
         return Verdict.refuse(.unsupported, "deepseek_v41: a batch is one host token per slot");
     var states: [max_batch]*dsv41.State = undefined;
     var gens: [max_batch]u64 = undefined;
-    var alone = m.mdl.pair != null or m.mdl.streamed != null;
+    var alone = n > dsv41.maxBatchRows(m.mdl);
     for (f.slots.slice(), 0..) |slot, k| {
         if (f.positions.len == n and f.positions.slice()[k] == 0) {
             alone = true;
@@ -457,7 +457,7 @@ fn stateOf(m: *Model, slot: u32) ?struct { st: *dsv41.State, gen: u64 } {
 /// hold until a slot is activated or released.
 pub fn slotStates(mp: *anyopaque, slots: []const u32, states: []*dsv41.State, gens: []u64) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (m.mdl.pair != null or m.mdl.streamed != null) return false;
+    if (slots.len > dsv41.maxBatchRows(m.mdl)) return false;
     for (slots, states, gens) |slot, *st, *g| {
         const live = stateOf(m, slot) orelse return false;
         st.* = live.st;

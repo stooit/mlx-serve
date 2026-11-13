@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const cfg_mod = @import("config.zig");
+const env = @import("../../env.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const system = @import("../../sdk/util/system.zig");
@@ -69,11 +70,18 @@ pub fn streamReserveAt(c: *const cfg_mod.Config, context: u64, chunk: u64, slots
 /// `context + stream_generation`).
 pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64, active_slots: u8, cache_bytes: u64) struct { prompt: u64, decode: u64 } {
     const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
-    const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
+    const box = streamBoxOverride() orelse @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
     return .{
         .prompt = box -| streamCacheReserveAt(config, context, stream_call_rows, active_slots, cache_bytes),
         .decode = box -| streamCacheReserveAt(config, context + stream_generation, 1, active_slots, cache_bytes),
     };
+}
+
+/// `MLX_SERVE_DSV41_STREAM_BOX_MB=N`: the operator's figure for the bank and its reserve, in place of the measured one.
+fn streamBoxOverride() ?u64 {
+    const raw = env.get(.MLX_SERVE_DSV41_STREAM_BOX_MB) orelse return null;
+    const mb = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch return null;
+    return if (mb == 0) null else mb << 20;
 }
 
 /// The table's `bill`: only the KV sources' compressed latents and index keys grow per token (bf16); the windows

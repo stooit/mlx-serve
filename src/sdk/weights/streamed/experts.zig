@@ -611,6 +611,22 @@ pub const TraceMath = struct {
 
 // ── The executor: the model's routed hook over a source ──
 
+const NoBarrier = struct {
+    var read: bool = false;
+    var after: u32 = 0;
+    var calls: [128]u32 = @splat(0);
+
+    fn skip(layer: u32) bool {
+        if (!read) {
+            after = if (env.get(.MLX_SERVE_DSV41_NOBARRIER_AFTER)) |v| std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch 0 else 0;
+            read = true;
+        }
+        if (after == 0 or layer >= calls.len) return false;
+        calls[layer] +|= 1;
+        return calls[layer] > after;
+    }
+};
+
 /// `argsort(positions)` of unique positions: `inv[pos[j]] = j` (the row of
 /// the joined outputs that holds routed position `pos[j]`).
 fn invertPositions(pos: []const u32, inv: []u32) void {
@@ -1576,6 +1592,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // DEVROUTE (decode): the barrier's arrays committed, then the device hit wave behind them (before the host waits).
             const dev: ?T = if (comptime @hasDecl(S, "decoding")) (if (self.devroute and self.source.decoding()) try self.devWave(g, layer, xf, indices, n, k) else null) else null;
             if (dev) |d| {
+                // EXPERIMENT (MLX_SERVE_DSV41_NOBARRIER_AFTER): a warm layer's call ends at the device wave, nothing read back.
+                if (comptime ending == .take) if (NoBarrier.skip(layer)) {
+                    try g.asyncEval(&.{d});
+                    return g.reshape(d, &.{ @intCast(n), @intCast(k), self.hidden });
+                };
                 try g.asyncEval(bar[0..n_bar]);
                 try g.asyncEval(&.{d});
             }

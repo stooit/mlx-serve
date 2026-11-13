@@ -3482,7 +3482,7 @@ pub const Want = enum { last, all };
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
 pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !A {
-    if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
+    if (sh.floor == null and sh.img.ctx == null and (m.streamed == null or streamedFuses(m)) and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
         if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| return y;
     if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
@@ -3545,14 +3545,102 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     };
     if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
         pre.* = f.sf.pre;
+        if (m.streamed != null) {
+            // A streamed bank: the fused stages up to the routes, the bank's routed sum, the expand.
+            var y: [1]A = undefined;
+            try runRegion(sc, m, li, .ffn_post, &.{ f.x1, f.sf.post, f.sf.comb, f.h2, try sourceRows(sc, m, li, f.h2, f.idx, f.wts) }, &y);
+            return y[0];
+        }
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    if (m.streamed != null) {
+        var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
+        try runRegion(sc, m, li, .ffn_pre, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &p);
+        var y: [1]A = undefined;
+        try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], try sourceRows(sc, m, li, p[4], p[5], p[6]) }, &y);
+        pre.* = p[1];
+        return y[0];
+    }
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
     pre.* = out[1];
     return out[0];
+}
+
+/// A streamed block up to its routes on the fused stages (`blockFused`'s front): the stream after attention, the FFN's
+/// split, its normed input and routes. Null (before anything is written) where the first stages do not serve the rows.
+const Front = struct { x1: A, pre: A, post: A, comb: A, h: A, idx: A, wts: A };
+
+fn fusedFront(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A, p0: usize, sh: *Shared) !?Front {
+    const kp = &(m.dec.in_proj orelse return null);
+    const kq = m.dec.wq_b orelse return null;
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const L = dim(x, 0);
+    const pos = try sc.i(ci(p0));
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre) orelse return null;
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
+    try ls.win.write(w.kv_row, p0, sc.s);
+    var comp_rows = none;
+    var topk = none;
+    if (ly.ratio > 0) {
+        const clen = (p0 + L) / ly.ratio;
+        if (ly.comp) |*cw| if (!try compressFused(sc, m, st, li, a.comp.?, p0)) try compressFrom(sc, m, st, li, cw, a.comp.?, p0);
+        if (ly.idx) |_| sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, a.iw.?, w.q_idx.?, p0, sh);
+        topk = sh.topk;
+        if (clen > 0 and topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
+    }
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
+    const inv = ropeFor(m, li).inv;
+    var oa: ?A = null;
+    if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, w.q, ls.win, comp_rows, topk, p0, scale)) |p| {
+        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
+    };
+    if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f|
+        return .{ .x1 = f.x1, .pre = f.sf.pre, .post = f.sf.post, .comb = f.sf.comb, .h = f.h2, .idx = f.idx, .wts = f.wts };
+    var ao: [1]A = undefined;
+    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    var p: [7]A = undefined;
+    try runRegion(sc, m, li, .ffn_pre, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &p);
+    return .{ .x1 = p[0], .pre = p[1], .post = p[2], .comb = p[3], .h = p[4], .idx = p[5], .wts = p[6] };
+}
+
+/// EXPERIMENT (`XBits.fused_merge`): several histories' rows, each history's front on the fused stages, one routed
+/// call and one expand over every row. False (nothing written) where the stages do not serve the first history.
+fn fusedMergedLayer(m: *Dsv41Model, sc: *Scope, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !bool {
+    const N = states.len;
+    var fr: [region_rows]Front = undefined;
+    for (states, parts, 0..) |st, x, k| {
+        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+        fr[k] = try fusedFront(sc, m, st, li, x, sp.pres[k], st.n, &sh) orelse {
+            if (k == 0) return false;
+            return error.Dsv41BatchUnsupported;
+        };
+        hold(&sp.topks[k], sh.topk);
+        hold(&sp.cands[k], sh.cand);
+    }
+    var cols: [7][region_rows]A = undefined;
+    for (fr[0..N], 0..) |f, k| {
+        cols[0][k] = f.x1;
+        cols[1][k] = f.pre;
+        cols[2][k] = f.post;
+        cols[3][k] = f.comb;
+        cols[4][k] = f.h;
+        cols[5][k] = f.idx;
+        cols[6][k] = f.wts;
+    }
+    const h = try sc.concat(cols[4][0..N], 0);
+    const routed_rows = try sourceRows(sc, m, li, h, try sc.concat(cols[5][0..N], 0), try sc.concat(cols[6][0..N], 0));
+    var y: [1]A = undefined;
+    try runRegion(sc, m, li, .ffn_post, &.{ try sc.concat(cols[0][0..N], 0), try sc.concat(cols[2][0..N], 0), try sc.concat(cols[3][0..N], 0), h, routed_rows }, &y);
+    for (0..N) |k| {
+        const lo, const hi = sp.bounds(k);
+        hold(&sp.xs[k], try sc.slice(y[0], 0, lo, hi));
+        hold(&sp.pres[k], fr[k].pre);
+    }
+    return true;
 }
 
 /// wo_b through the routes on the fused `ffn_in` launches: the new stream, the FFN's normed input, split and routes.
@@ -3874,7 +3962,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             defer ev.deinit(gpa);
             for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
             try appendLayerState(gpa, &ev, &st.layers[li]);
-            if (!decode) try evalAll(ev.items) else {
+            if (!decode) try evalAll(ev.items) else if (!(m.streamed != null and XBits.has(XBits.no_layer_commit))) {
                 // A decode step's graph takes the host about as long as the GPU
                 // takes to run it: hand each layer over as it is built.
                 const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
@@ -4852,7 +4940,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
 pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool) !A {
     const c = &m.cfg;
     const N = chunks.len;
-    if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
+    if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null) return error.Dsv41BatchUnsupported;
     const offs = try gpa.alloc(usize, N + 1);
     defer gpa.free(offs);
     offs[0] = 0;
@@ -4862,6 +4950,10 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         offs[k + 1] = offs[k] + ch.len;
     }
     const R = offs[N];
+    if (m.streamed) |src| {
+        _ = src;
+        if (R > if (N == 1) streamLaneRows(m) else maxBatchRows(m)) return error.Dsv41BatchUnsupported;
+    }
     for (states, 0..) |st, k| for (states[0..k]) |o| if (o == st) return error.Dsv41BatchUnsupported;
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
@@ -4872,6 +4964,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         return e;
     };
     errdefer if (verify) for (states) |st| st.dropVerify();
+    if (m.streamed) |src| try src.phase(false);
     const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
     // Each state's Engram row ids off its own look-back, laid out by row as one chunk's.
     const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
@@ -4949,7 +5042,10 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     const rows = try gpa.alloc(A, N);
     defer gpa.free(rows);
     for (rows, 0..) |*h, k| h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
-    const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
+    const logits = if (m.streamed != null and N == 1) blk: {
+        for (rows) |*h| h.* = try sc.astype(try m.head.apply(&sc, try sc.rms(h.*, m.norm, c.rms_norm_eps)), .float32);
+        break :blk try sc.concat(rows, 0);
+    } else try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -4964,6 +5060,309 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     return sc.out(logits);
 }
 
+
+/// `MLX_SERVE_DSV41_ROUTE_TRACE=1`: what a decode call's routes would save if experts were shared or thinned. By the
+/// call's rows: routed pairs against distinct experts; by threshold: the pairs whose share of their row's weight falls
+/// under it, and the weight they carry.
+const RouteTrace = struct {
+    const thresholds = [_]f32{ 0.02, 0.04, 0.06, 0.08, 0.12 };
+    var read: bool = false;
+    var enabled: bool = false;
+    var twice: bool = false;
+    var same: bool = false;
+    var calls: [region_rows + 1]u64 = @splat(0);
+    var pairs: [region_rows + 1]u64 = @splat(0);
+    var distinct: [region_rows + 1]u64 = @splat(0);
+    var rank_mass: [8]f64 = @splat(0);
+    var rows_seen: u64 = 0;
+    var under_pairs: [thresholds.len]u64 = @splat(0);
+    var under_mass: [thresholds.len]f64 = @splat(0);
+    var total: u64 = 0;
+    var pass_pairs: u64 = 0;
+    var pass_distinct: u64 = 0;
+
+    fn on() bool {
+        if (!read) {
+            enabled = if (env.get(.MLX_SERVE_DSV41_ROUTE_TRACE)) |v| v[0] == '1' or v[0] == '2' or v[0] == '3' else false;
+            twice = if (env.get(.MLX_SERVE_DSV41_ROUTE_TRACE)) |v| v[0] == '2' or v[0] == '3' else false;
+            same = if (env.get(.MLX_SERVE_DSV41_ROUTE_TRACE)) |v| v[0] == '3' else false;
+            read = true;
+        }
+        return enabled;
+    }
+
+    fn note(idx: A, wts: A) !void {
+        const R = dim(idx, 0);
+        const K = dim(idx, 1);
+        if (R == 0 or R > region_rows or K == 0 or K > 8) return;
+        try mlx.check(mlx.mlx_array_eval(idx));
+        try mlx.check(mlx.mlx_array_eval(wts));
+        if (mlx.mlx_array_dtype(idx) != .uint32 or mlx.mlx_array_dtype(wts) != .float32) return;
+        const ids = (mlx.mlx_array_data_uint32(idx) orelse return)[0 .. R * K];
+        const w = (mlx.mlx_array_data_float32(wts) orelse return)[0 .. R * K];
+        var seen: [region_rows * 8]u32 = undefined;
+        var n: usize = 0;
+        for (ids) |e| {
+            if (std.mem.indexOfScalar(u32, seen[0..n], e) == null) {
+                seen[n] = e;
+                n += 1;
+            }
+        }
+        calls[R] += 1;
+        pairs[R] += R * K;
+        distinct[R] += n;
+        pass_pairs += R * K;
+        pass_distinct += n;
+        for (0..R) |r| {
+            var row: [8]f32 = undefined;
+            var sum: f32 = 0;
+            for (w[r * K ..][0..K], row[0..K]) |x, *o| {
+                o.* = @abs(x);
+                sum += @abs(x);
+            }
+            if (!(sum > 0)) continue;
+            std.mem.sort(f32, row[0..K], {}, std.sort.desc(f32));
+            rows_seen += 1;
+            for (row[0..K], 0..) |x, k| {
+                const share = x / sum;
+                rank_mass[k] += share;
+                for (thresholds, 0..) |t, ti| if (share < t) {
+                    under_pairs[ti] += 1;
+                    under_mass[ti] += share;
+                };
+            }
+        }
+        total += 1;
+        if (total % 4000 == 0) report(K);
+    }
+
+    fn report(K: usize) void {
+        for (1..region_rows + 1) |r| if (calls[r] > 0)
+            log.info("[route] rows={d} calls={d} pairs={d} distinct={d} shared={d:.3}\n", .{ r, calls[r], pairs[r], distinct[r], 1.0 - @as(f64, @floatFromInt(distinct[r])) / @as(f64, @floatFromInt(pairs[r])) });
+        const rs: f64 = @floatFromInt(@max(rows_seen, 1));
+        log.info("[route] weight share by rank: {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} (rows {d})\n", .{ rank_mass[0] / rs, rank_mass[1] / rs, rank_mass[2] / rs, rank_mass[3] / rs, rank_mass[4] / rs, rank_mass[5] / rs, rows_seen });
+        for (thresholds, 0..) |t, ti|
+            log.info("[route] share<{d:.2}: pairs {d:.3} carrying weight {d:.4}\n", .{ t, @as(f64, @floatFromInt(under_pairs[ti])) / (rs * @as(f64, @floatFromInt(K))), under_mass[ti] / rs });
+    }
+};
+
+/// The routed pairs and distinct experts (summed over layers) since the last call, under the route trace; zeros off it.
+pub fn routeTraceTake() [2]u64 {
+    const out = [2]u64{ RouteTrace.pass_pairs, RouteTrace.pass_distinct };
+    RouteTrace.pass_pairs = 0;
+    RouteTrace.pass_distinct = 0;
+    return out;
+}
+
+/// Experiment switches (`MLX_SERVE_DSV41_XBITS_FILE`): the file's decimal mask, re-read at most every 200 ms, so one
+/// process serves both arms of a paired benchmark. Zero without the file.
+pub const XBits = struct {
+    pub const fused_off: u32 = 1;
+    pub const ladder_rows: u32 = 2;
+    pub const weak_copy_off: u32 = 4;
+    /// EXPERIMENT: a streamed decode step leaves each layer's tail to the next layer's commit.
+    pub const no_layer_commit: u32 = 8;
+    /// EXPERIMENT: the calling (inference) thread at user-interactive QoS while set, default QoS when cleared.
+    pub const qos_interactive: u32 = 16;
+    /// EXPERIMENT: the drafting backoff's longest plain stretch 8 (32) or 4 (64) rounds instead of 32.
+    pub const backoff_8: u32 = 32;
+    pub const backoff_4: u32 = 64;
+    pub const backoff_2: u32 = 128;
+    pub const backoff_1: u32 = 256;
+    /// EXPERIMENT: every round drafts.
+    pub const backoff_none: u32 = 512;
+    /// EXPERIMENT control: the backoff as it was (no shorter stretch while narrowly losing).
+    pub const backoff_flat: u32 = 1024;
+    /// EXPERIMENT: group passes run each history's front on the fused stages (`fusedMergedLayer`).
+    pub const fused_merge: u32 = 2048;
+    var qos_applied: bool = false;
+    var path: ?[*:0]const u8 = null;
+    var read: bool = false;
+    var value: u32 = 0;
+    var at_us: i64 = 0;
+
+    pub fn get() u32 {
+        if (!read) {
+            path = env.get(.MLX_SERVE_DSV41_XBITS_FILE);
+            read = true;
+        }
+        const p = path orelse return 0;
+        const now = monoUs();
+        if (now - at_us < 200_000) return value;
+        at_us = now;
+        const fd = std.c.open(p, .{ .ACCMODE = .RDONLY });
+        if (fd < 0) {
+            value = 0;
+            return 0;
+        }
+        defer _ = std.c.close(fd);
+        var buf: [16]u8 = undefined;
+        const n = std.c.read(fd, &buf, buf.len);
+        value = if (n > 0) std.fmt.parseInt(u32, std.mem.trim(u8, buf[0..@intCast(n)], " \n\r\t"), 10) catch 0 else 0;
+        const want = value & qos_interactive != 0;
+        if (want != qos_applied) {
+            _ = pthread_set_qos_class_self_np(if (want) 0x21 else 0x15, 0);
+            qos_applied = want;
+        }
+        return value;
+    }
+
+    pub fn has(bit: u32) bool {
+        return get() & bit != 0;
+    }
+};
+
+extern "c" fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) c_int;
+
+/// Whether a streamed bank's solo decode rows take the fused decode stages around the bank's call
+/// (`MLX_SERVE_DSV41_STREAM_FUSED=0`: the compiled regions, as before).
+fn streamedFuses(m: *const Dsv41Model) bool {
+    const src = m.streamed orelse return false;
+    if (src.math != .source) return false;
+    const Sw = struct {
+        var read: bool = false;
+        var on: bool = true;
+    };
+    if (!Sw.read) {
+        Sw.on = if (env.get(.MLX_SERVE_DSV41_STREAM_FUSED)) |v| v[0] != '0' else true;
+        Sw.read = true;
+    }
+    return Sw.on and !XBits.has(XBits.fused_off);
+}
+
+/// The bank's routed sum for decode rows `h` `[R, dim]` with routes `idx` / `wts`: one source call a lane
+/// (`streamLaneRows`) of rows, so a batch wider than the lane stays decode-phase calls of the width the bank serves.
+fn sourceRows(sc: *Scope, m: *Dsv41Model, li: usize, h: A, idx: A, wts: A) !A {
+    if (RouteTrace.on()) {
+        if (RouteTrace.twice) {
+            // The expert cost probe: the call's routed sum computed a second time and added at weight zero.
+            // Mode 3: the second call routes every row to the first row's experts (the most a call can share).
+            const R = dim(idx, 0);
+            const idx2 = if (RouteTrace.same) try sc.broadcast(try sc.slice(idx, 0, 0, 1), &.{ ci(R), ci(dim(idx, 1)) }) else idx;
+            const again = try sourceRowsOnce(sc, m, li, h, idx2, wts);
+            const once = try sourceRowsOnce(sc, m, li, h, idx, wts);
+            return sc.add(once, try sc.mul(again, try sc.f(0)));
+        }
+        RouteTrace.note(idx, wts) catch {};
+    }
+    return sourceRowsOnce(sc, m, li, h, idx, wts);
+}
+
+fn sourceRowsOnce(sc: *Scope, m: *Dsv41Model, li: usize, h: A, idx: A, wts: A) !A {
+    const src = m.streamed.?;
+    const R = dim(h, 0);
+    const lane = streamLaneRows(m);
+    if (R <= lane) return sc.keep(try src.math.source(src.ctx, @intCast(li), h, idx, wts).get());
+    var outs: [region_rows]A = undefined;
+    var n: usize = 0;
+    var lo: usize = 0;
+    while (lo < R) : (lo += lane) {
+        const hi = @min(R, lo + lane);
+        outs[n] = try sc.keep(try src.math.source(src.ctx, @intCast(li), try sc.slice(h, 0, lo, hi), try sc.slice(idx, 0, lo, hi), try sc.slice(wts, 0, lo, hi)).get());
+        n += 1;
+    }
+    return sc.concat(outs[0..n], 0);
+}
+
+/// A streamed layer over several histories' rows at once: the mixes, projections, router and routed experts read their
+/// weights once for every state's rows (as `batchedLayer`'s compiled stretches do); the rope, the window and the
+/// attention stay each state's own. Rows match a solo step to kernel numerics, not bits.
+fn mergedStreamLayer(m: *Dsv41Model, sc: *Scope, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !void {
+    const N = states.len;
+    const x = try sc.concat(parts, 0);
+    var a: [4]A = undefined; // the attention's pre, post, comb; its input
+    try runRegion(sc, m, li, .attn_in, &.{ x, try sc.concat(sp.pres, 0) }, &a);
+    var q: [3]A = undefined; // query heads, window rows, query latents
+    try runRegion(sc, m, li, .q_rows, &.{a[3]}, &q);
+    const heads = try sc.a.alloc(A, N);
+    defer sc.a.free(heads);
+    for (heads, states, 0..) |*o, st, k| {
+        var ssc = Scope.init(sc.a, m.s);
+        defer ssc.deinit();
+        const lo, const hi = sp.bounds(k);
+        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+        const rows: Proj = .{ .q = try ssc.slice(q[0], 0, lo, hi), .kv = try ssc.slice(q[1], 0, lo, hi), .qr = try ssc.slice(q[2], 0, lo, hi) };
+        const pj = try ropeProj(&ssc, m, &m.layers[li], ropeFor(m, li).fwd, rows, try ssc.i(ci(st.n)));
+        o.* = try sc.keep(ssc.out(try attentionHeads(&ssc, m, st, li, try ssc.slice(a[3], 0, lo, hi), st.n, &sh, pj)));
+        hold(&sp.topks[k], sh.topk);
+        hold(&sp.cands[k], sh.cand);
+    }
+    var ao: [1]A = undefined;
+    try runRegion(sc, m, li, .attn_out, &.{try sc.concat(heads, 0)}, &ao);
+    var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, its normed input, its routes
+    try runRegion(sc, m, li, .ffn_pre, &.{ x, ao[0], a[0], a[1], a[2] }, &p);
+    const routed_rows = try sourceRows(sc, m, li, p[4], p[5], p[6]);
+    var y: [1]A = undefined;
+    try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], routed_rows }, &y);
+    for (0..N) |k| {
+        const lo, const hi = sp.bounds(k);
+        hold(&sp.xs[k], try sc.slice(y[0], 0, lo, hi));
+        hold(&sp.pres[k], try sc.slice(p[1], 0, lo, hi));
+    }
+}
+
+// One history keeps the serial trunk's row geometry; several share every weight read (`mergedStreamLayer`).
+fn batchedStreamLayer(m: *Dsv41Model, sc: *Scope, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !void {
+    if (states.len > 1 and li < m.regions.len and compiledAt(m, sp.L)) {
+        if (XBits.has(XBits.fused_merge) and streamedFuses(m)) {
+            var fits = true;
+            for (parts) |x| fits = fits and dim(x, 0) <= dkern.max_rows;
+            if (fits and try fusedMergedLayer(m, sc, states, sp, li, parts)) return;
+        }
+        return mergedStreamLayer(m, sc, states, sp, li, parts);
+    }
+    const Row = struct { x: A, sf: Split, h: A, idx: A, wts: A, compiled: bool };
+    const rows = try sc.a.alloc(Row, states.len);
+    defer sc.a.free(rows);
+    const inputs = try sc.a.alloc(A, states.len);
+    defer sc.a.free(inputs);
+    const ids = try sc.a.alloc(A, states.len);
+    defer sc.a.free(ids);
+    const weights = try sc.a.alloc(A, states.len);
+    defer sc.a.free(weights);
+    for (parts, states, rows, 0..) |x, st, *r, k| {
+        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+        r.compiled = li < m.regions.len and compiledAt(m, dim(x, 0));
+        if (r.compiled) {
+            var a: [4]A = undefined;
+            try runRegion(sc, m, li, .attn_in, &.{ x, sp.pres[k] }, &a);
+            const ao = try attention(sc, m, st, li, a[3], st.n, &sh, null);
+            var p: [7]A = undefined;
+            try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
+            r.x = p[0];
+            r.sf = .{ .pre = p[1], .post = p[2], .comb = p[3] };
+            r.h = p[4];
+            r.idx = p[5];
+            r.wts = p[6];
+        } else {
+            const mid = try blockAttn(sc, m, st, li, x, sp.pres[k], st.n, &sh);
+            const routes = try route(sc, m, &m.layers[li], mid.h, none);
+            r.x = mid.x1;
+            r.sf = mid.sf;
+            r.h = mid.h;
+            r.idx = routes.idx;
+            r.wts = routes.wts;
+        }
+        inputs[k] = r.h;
+        ids[k] = r.idx;
+        weights[k] = r.wts;
+        hold(&sp.topks[k], sh.topk);
+        hold(&sp.cands[k], sh.cand);
+    }
+    const routed_rows = try sourceRows(sc, m, li, try sc.concat(inputs, 0), try sc.concat(ids, 0), try sc.concat(weights, 0));
+    for (rows, 0..) |*r, k| {
+        const lo, const hi = sp.bounds(k);
+        const mine = try sc.slice(routed_rows, 0, lo, hi);
+        const y = if (r.compiled) blk: {
+            var out: [1]A = undefined;
+            try runRegion(sc, m, li, .ffn_post, &.{ r.x, r.sf.post, r.sf.comb, r.h, mine }, &out);
+            break :blk out[0];
+        } else try hcExpand(sc, r.x, try withShared(sc, m, &m.layers[li], r.h, mine), &r.sf);
+        hold(&sp.xs[k], y);
+        hold(&sp.pres[k], r.sf.pre);
+    }
+}
+
 /// Layer `li` of `extendBatched`: the compiled stretches over every state's rows, attention per state.
 fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, sp: *const Spans, li: usize) !void {
     const N = sp.xs.len;
@@ -4972,6 +5371,7 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     const parts = try gpa.alloc(A, N);
     defer gpa.free(parts);
     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+    if (m.streamed != null) return batchedStreamLayer(m, &sc, states, sp, li, parts);
     if (li >= m.regions.len or !compiledAt(m, sp.L)) {
         // No compiled stretch at this width: each state's block alone.
         for (parts, states, 0..) |x, st, k| {
@@ -5194,6 +5594,25 @@ pub fn dsparkBegin(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
 
 /// Most drafts one verify chunk carries: its rows and `t1` fit the windows' slack.
 pub const VERIFY_MAX_DRAFTS: usize = RING_SLACK - 1;
+
+/// Rows one batched call (`extendBatched`) carries over all its states: the compiled regions' width. A streamed EXL3
+/// bank serves them a decode lane at a time (`sourceRows`); one state alone stays inside one lane (`streamLaneRows`).
+/// Zero where the module runs no batch.
+pub fn maxBatchRows(m: *const Dsv41Model) usize {
+    if (m.pair != null) return 0;
+    const src = m.streamed orelse return region_rows;
+    if (src.math != .source) return 0;
+    return if (streamLaneRows(m) >= 2) region_rows else 0;
+}
+
+/// Rows one source call of a streamed EXL3 bank serves in decode: `Routed.decode_ids` over top-k, inside the rows its
+/// read-ahead scores (`sdk_ext/expert/lookahead.zig` `max_rows`).
+pub fn streamLaneRows(m: *const Dsv41Model) usize {
+    const src = m.streamed orelse return region_rows;
+    return @min(region_rows, stream_batch_rows, src.decode_ids / m.cfg.num_experts_per_tok);
+}
+
+const stream_batch_rows: usize = 8;
 
 /// Drafts one verify of `m` takes: on a streamed bank the verify stays a decode-phase call (`Routed.decode_ids`).
 pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {

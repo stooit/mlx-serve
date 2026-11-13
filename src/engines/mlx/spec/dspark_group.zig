@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
+const env = @import("../../../env.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const dflash_policy = @import("dflash/policy.zig");
@@ -36,7 +37,7 @@ pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
 /// unpaired). Its DSpark slots keep drafting beside company instead of yielding to the plain batch.
 pub fn groupable(xfm: *const Transformer) bool {
     const m = intree.dsv41(xfm) orelse return false;
-    return m.dspark != null and m.pair == null and m.streamed == null;
+    return m.dspark != null and dsv41_mod.maxBatchRows(m) >= 2;
 }
 
 /// Whether `slot` ticks DSpark rounds on a groupable model.
@@ -60,12 +61,19 @@ pub fn runDsparkGroups(sch: *Scheduler, slots: []*Slot) !void {
         while (end < slots.len and slots[end].model == slots[start].model) end += 1;
         var g0 = start;
         while (g0 < end) {
-            const sub = slots[g0..@min(end, g0 + MAX_SLOTS)];
+            const sub = slots[g0..@min(end, g0 + groupSlots(slots[g0]))];
             if (sub.len == 1) try runSingleDecodeTick(sch, sub[0]) else try runGroupTick(sch, sub);
             g0 += sub.len;
         }
         start = end;
     }
+}
+
+/// Slots one group round of `slot`'s model carries: a row each at least, inside the module's batch.
+fn groupSlots(slot: *const Slot) usize {
+    const xfm = slot.model.transformer orelse return 1;
+    const m = intree.dsv41(xfm) orelse return 1;
+    return std.math.clamp(dsv41_mod.maxBatchRows(m), 1, MAX_SLOTS);
 }
 
 fn runGroupTick(sch: *Scheduler, group: []*Slot) !void {
@@ -151,6 +159,9 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     var drafts: [MAX_SLOTS]dsv41_mod.DsparkDraft = undefined;
     var caps: [MAX_SLOTS]u32 = undefined;
     var suffix: [MAX_SLOTS]u32 = @splat(0);
+    // The rows the module batches in one call: every slot's `t1` and the drafts the group buys.
+    const max_rows: usize = dsv41_mod.maxBatchRows(mdl);
+    if (n > max_rows) return error.Dsv41BatchUnsupported;
     var made: usize = 0;
     defer for (drafts[0..made]) |*d| d.deinit(gpa);
     var staged: [MAX_SLOTS]usize = undefined;
@@ -162,7 +173,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
         const copy = dsparkCopyLen(found, gen.max_tokens -| gen.completion_tokens -| 1, mdl.ds_block);
         // A group with no row to spare verifies no stage draft: it drafts none.
-        const stage = copy == 0 and n < dflash_policy.MAX_GROUP_ROWS and if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true;
+        const stage = copy == 0 and n < max_rows and if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true;
         kinds[k] = if (copy > 0) .copy else if (stage) .stage else .plain;
         if (stage) {
             staged[n_stage] = k;
@@ -209,7 +220,15 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         p[k] = probs[k][0..avail];
     }
     const cost = &xfm.dspark_group_cost;
-    const costs = cost.costs(n);
+    // A streamed bank's rounds price on their own fit, set once (the scale then follows this machine).
+    if (mdl.streamed != null and cost.base != dflash_policy.GroupCost.streamed.base) cost.* = dflash_policy.GroupCost.streamed;
+    var costs = cost.costs(n);
+    // The round has paid its drafts whatever it verifies: the rate each row is judged by counts them.
+    if (n_stage > 0 and !dsv41_mod.XBits.has(dsv41_mod.XBits.ladder_rows)) for (&costs) |*c| {
+        c.* += draft_ms;
+    };
+    // Rows past the module's batch are never bought.
+    for (costs[@min(max_rows, dflash_policy.MAX_GROUP_ROWS) + 1 ..]) |*c| c.* = std.math.inf(f32);
     var rows_k: [MAX_SLOTS]u32 = undefined;
     _ = dflash_policy.chooseGroupRows(p[0..n], &costs, rows_k[0..n]);
     var chunks: [MAX_SLOTS][]const u32 = undefined;
@@ -221,6 +240,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     }
 
     // One verify: a round that verifies no draft is the group's plain step, with nothing to roll back.
+    if (groupTrace()) _ = dsv41_mod.routeTraceTake();
     const verify_watch = io_util.Stopwatch.init(gens[0].timer.io);
     const drafted = rows > n;
     const logits = try dsv41_mod.extendBatched(mdl, gpa, states[0..n], ids[0..n], chunks[0..n], drafted);
@@ -274,7 +294,12 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
             gens[k].sampling.draw = sp.draw;
         }
     }
-    cost.sample(n, rows, msOf(verify_watch.read()));
+    const verify_ms = msOf(verify_watch.read());
+    cost.sample(n, rows, verify_ms);
+    if (groupTrace()) {
+        const rt = dsv41_mod.routeTraceTake();
+        log.info("[group] states={d} rows={d} draft_ms={d:.1} verify_ms={d:.1} priced={d:.1} pairs={d} distinct={d}\n", .{ n, rows, draft_ms, verify_ms, cost.ms(n, rows), rt[0], rt[1] });
+    }
 
     // Each slot keeps its prefix, and teaches its drafting backoff what drafting cost the round (its share of the draft,
     // its rows) against what its accepted drafts saved (the group's plain step a token).
@@ -308,6 +333,18 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * cost.rowMs();
         pol.drafting.record(@as(f32, @floatFromInt(a)) * token_ms, spent);
     };
+}
+
+fn groupTrace() bool {
+    const S = struct {
+        var read: bool = false;
+        var on: bool = false;
+    };
+    if (!S.read) {
+        S.on = if (env.get(.MLX_SERVE_DSV41_GROUP_TRACE)) |v| v[0] == '1' else false;
+        S.read = true;
+    }
+    return S.on;
 }
 
 /// Rows [lo, lo + n) of `logits` `[R, V]` (caller frees).

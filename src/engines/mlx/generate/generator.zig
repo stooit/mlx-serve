@@ -675,6 +675,7 @@ pub const Generator = struct {
     pub const PldStepResult = @import("../spec/pld.zig").PldStepResult;
     pub const nextDspark = @import("../spec/dspark.zig").nextDspark;
     pub const dsparkCopyStep = @import("../spec/dspark.zig").dsparkCopyStep;
+    pub const dsparkWeakCopyLen = @import("../spec/dspark.zig").dsparkWeakCopyLen;
     pub const dsparkStep = @import("../spec/dspark.zig").dsparkStep;
     pub const dsparkPlainPipelined = @import("../spec/dspark.zig").dsparkPlainPipelined;
     pub const dsparkPolicyStep = @import("../spec/dspark.zig").dsparkPolicyStep;

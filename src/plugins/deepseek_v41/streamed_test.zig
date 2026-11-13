@@ -381,6 +381,190 @@ fn requireM2Readiness() !void {
     std.debug.print("M2 EXL3 readiness: device={s}, NAX=false\n", .{arch});
 }
 
+test "deepseek_v41 streamed batch: two and four histories share one EXL3 route per layer" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend() or mlx.virtualGpu() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [512]u8 = undefined;
+    const dir = try writeReadinessPackWithEngram(&tmp, &path, true);
+    const r = try Resident.open(dir, .{ .act = .bfloat16, .qat = true, .head_8bit = false, .streamed_experts = true });
+    defer r.close();
+    const Exl3 = streamed_w.Exl3;
+    const c = &r.cfg;
+    const geo: Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(r.m.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
+    const z = try Exl3.billOf(testing.allocator, testing.io, dir, geo, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2 });
+    var gates: [4]Exl3.Gate = undefined;
+    for (&gates, r.m.layers[0..4]) |*g, *ly| g.* = .{ .w = ly.gate_w, .bias = ly.gate_bias };
+    const src = try Exl3.Source.open(testing.allocator, testing.io, dir, r.s, geo, &gates, .{ .prompt = z.prompt_windows + z.staging + 2 * z.row_bytes, .decode = z.decode_windows + z.staging + 3 * z.row_bytes });
+    defer src.deinit();
+    r.m.streamed = streamed_w.exl3Routed(src);
+    defer r.m.streamed = null;
+    const ids = readinessIds();
+    const lengths = [_]usize{ 31, 63, 127, 255 };
+    for ([_]usize{ 2, 4 }) |n| {
+        var serial: [4]dsv41.State = undefined;
+        var grouped: [4]dsv41.State = undefined;
+        var made_serial: usize = 0;
+        var made_grouped: usize = 0;
+        defer for (serial[0..made_serial]) |*st| st.deinit();
+        defer for (grouped[0..made_grouped]) |*st| st.deinit();
+        for (0..n) |k| {
+            serial[k] = try dsv41.initState(r.m, testing.allocator);
+            made_serial += 1;
+            grouped[k] = try dsv41.initState(r.m, testing.allocator);
+            made_grouped += 1;
+            for ([_]*dsv41.State{ &serial[k], &grouped[k] }) |st| {
+                const l = try dsv41.extend(r.m, testing.allocator, st, ids[k .. k + lengths[k]], .last);
+                defer _ = mlx.mlx_array_free(l);
+                var scratch: [readiness_vocab]f32 = undefined;
+                try readReadinessRow(l, &scratch);
+                try src.settle();
+            }
+        }
+        try testing.expectError(error.Dsv41BatchUnsupported, dsv41.extendBatched(r.m, testing.allocator, &.{ &grouped[0], &grouped[0] }, &.{ 0, 0 }, &.{ ids[0..1], ids[1..2] }, false));
+        if (n == 4) {
+            try testing.expectError(error.Dsv41BatchUnsupported, dsv41.extendBatched(r.m, testing.allocator, &.{ &grouped[0], &grouped[1], &grouped[2], &grouped[3] }, &.{ 0, 0, 0, 0 }, &.{ ids[0..6], ids[6..12], ids[12..18], ids[18..24] }, true));
+            for (grouped[0..n], lengths[0..n]) |st, len| {
+                try testing.expectEqual(len, st.n);
+                try testing.expect(st.verify == null);
+            }
+        }
+        for (0..8) |step| {
+            var want: [4][readiness_vocab]f32 = undefined;
+            var ptrs: [4]*dsv41.State = undefined;
+            var chunks: [4][]const u32 = undefined;
+            const gens: [4]u64 = @splat(0);
+            for (0..n) |slot| {
+                const k = if (step % 2 == 0) slot else n - slot - 1;
+                const at = k + lengths[k] + step;
+                chunks[slot] = ids[at .. at + 1];
+                ptrs[slot] = &grouped[k];
+                const l = try dsv41.extend(r.m, testing.allocator, &serial[k], chunks[slot], .last);
+                defer _ = mlx.mlx_array_free(l);
+                try readReadinessRow(l, &want[slot]);
+                try src.settle();
+            }
+            const calls_before = src.stats().route_calls;
+            const l = try dsv41.extendBatched(r.m, testing.allocator, ptrs[0..n], gens[0..n], chunks[0..n], false);
+            defer _ = mlx.mlx_array_free(l);
+            var got: [4 * readiness_vocab]f32 = undefined;
+            try readReadinessRow(l, got[0 .. n * readiness_vocab]);
+            try src.settle();
+            try testing.expectEqual(@as(u64, r.m.n_layers), src.stats().route_calls - calls_before);
+            for (0..n) |slot| {
+                const k = if (step % 2 == 0) slot else n - slot - 1;
+                try testing.expectEqual(lengths[k] + step + 1, grouped[k].n);
+                try testing.expectEqualSlices(u32, serial[k].hist.items, grouped[k].hist.items);
+                try expectRowsClose(&want[slot], got[slot * readiness_vocab ..][0..readiness_vocab], n);
+            }
+        }
+    }
+}
+
+test "deepseek_v41 streamed batch: grouped verify chunks match each history's solo verify, rollback included" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend() or mlx.virtualGpu() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [512]u8 = undefined;
+    const dir = try writeReadinessPackWithEngram(&tmp, &path, true);
+    const r = try Resident.open(dir, .{ .act = .bfloat16, .qat = true, .head_8bit = false, .streamed_experts = true });
+    defer r.close();
+    const Exl3 = streamed_w.Exl3;
+    const c = &r.cfg;
+    const geo: Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(r.m.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
+    const z = try Exl3.billOf(testing.allocator, testing.io, dir, geo, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2 });
+    var gates: [4]Exl3.Gate = undefined;
+    for (&gates, r.m.layers[0..4]) |*g, *ly| g.* = .{ .w = ly.gate_w, .bias = ly.gate_bias };
+    const src = try Exl3.Source.open(testing.allocator, testing.io, dir, r.s, geo, &gates, .{ .prompt = z.prompt_windows + z.staging + 2 * z.row_bytes, .decode = z.decode_windows + z.staging + 3 * z.row_bytes });
+    defer src.deinit();
+    r.m.streamed = streamed_w.exl3Routed(src);
+    defer r.m.streamed = null;
+    const lane = dsv41.streamLaneRows(r.m);
+    try testing.expect(lane >= 4 and lane <= dsv41.region_rows);
+    const ids = readinessIds();
+    const lengths = [_]usize{ 31, 63 };
+    const n = lengths.len;
+    var serial: [n]dsv41.State = undefined;
+    var grouped: [n]dsv41.State = undefined;
+    var made_serial: usize = 0;
+    var made_grouped: usize = 0;
+    defer for (serial[0..made_serial]) |*st| st.deinit();
+    defer for (grouped[0..made_grouped]) |*st| st.deinit();
+    for (0..n) |k| {
+        serial[k] = try dsv41.initState(r.m, testing.allocator);
+        made_serial += 1;
+        grouped[k] = try dsv41.initState(r.m, testing.allocator);
+        made_grouped += 1;
+        for ([_]*dsv41.State{ &serial[k], &grouped[k] }) |st| {
+            const l = try dsv41.extend(r.m, testing.allocator, st, ids[k .. k + lengths[k]], .last);
+            defer _ = mlx.mlx_array_free(l);
+            var scratch: [readiness_vocab]f32 = undefined;
+            try readReadinessRow(l, &scratch);
+            try src.settle();
+        }
+    }
+    // Chunk widths that fill the lane between them, and the prefix each history keeps (all, part, the committed token only).
+    const half = lane / 2;
+    // The last round is wider than the lane: the bank serves it in two source calls a layer.
+    const widths = [_][n]usize{ .{ half, lane - half }, .{ 1, lane - 1 }, .{ lane - 2, 2 }, .{ 2, 2 }, .{ lane - 2, lane - 2 } };
+    const keeps = [_][n]usize{ .{ half, 1 }, .{ 1, 2 }, .{ 1, 2 }, .{ 2, 1 }, .{ 3, 2 } };
+    const want = try testing.allocator.alloc(f32, 2 * lane * readiness_vocab);
+    defer testing.allocator.free(want);
+    const got = try testing.allocator.alloc(f32, 2 * lane * readiness_vocab);
+    defer testing.allocator.free(got);
+    for (widths, keeps) |w, keep| {
+        var chunks: [n][]const u32 = undefined;
+        var ptrs: [n]*dsv41.State = undefined;
+        const gens: [n]u64 = @splat(0);
+        var rows: usize = 0;
+        for (0..n) |k| {
+            const at = k + serial[k].n;
+            chunks[k] = ids[at .. at + w[k]];
+            ptrs[k] = &grouped[k];
+            // The solo round: this history's verify alone, then its rollback.
+            var d: dsv41.DsparkDraft = .{ .ids = @constCast(chunks[k]), .len = w[k] - 1, .logits = &.{}, .confidence = &.{} };
+            var pending = try dsv41.dsparkBeginWith(r.m, testing.allocator, &serial[k], chunks[k][0], &d);
+            defer pending.deinit();
+            try readReadinessRow(pending.vl_g, want[rows * readiness_vocab ..][0 .. w[k] * readiness_vocab]);
+            try src.settle();
+            try dsv41.finishVerify(r.m, testing.allocator, &serial[k], keep[k]);
+            rows += w[k];
+        }
+        try testing.expect(rows <= dsv41.maxBatchRows(r.m));
+        const l = try dsv41.extendBatched(r.m, testing.allocator, ptrs[0..n], gens[0..n], chunks[0..n], true);
+        defer _ = mlx.mlx_array_free(l);
+        try readReadinessRow(l, got[0 .. rows * readiness_vocab]);
+        try src.settle();
+        try expectRowsClose(want[0 .. rows * readiness_vocab], got[0 .. rows * readiness_vocab], n);
+        for (0..n) |k| {
+            try dsv41.finishVerify(r.m, testing.allocator, &grouped[k], keep[k]);
+            try testing.expectEqual(serial[k].n, grouped[k].n);
+            try testing.expect(grouped[k].verify == null);
+            try testing.expectEqualSlices(u32, serial[k].hist.items, grouped[k].hist.items);
+        }
+    }
+    // The states the rounds left behind still decode alike: one plain batched step against each solo step.
+    var chunks: [n][]const u32 = undefined;
+    var ptrs: [n]*dsv41.State = undefined;
+    const gens: [n]u64 = @splat(0);
+    for (0..n) |k| {
+        const at = k + serial[k].n;
+        chunks[k] = ids[at .. at + 1];
+        ptrs[k] = &grouped[k];
+        const l = try dsv41.extend(r.m, testing.allocator, &serial[k], chunks[k], .last);
+        defer _ = mlx.mlx_array_free(l);
+        try readReadinessRow(l, want[k * readiness_vocab ..][0..readiness_vocab]);
+        try src.settle();
+    }
+    const l = try dsv41.extendBatched(r.m, testing.allocator, ptrs[0..n], gens[0..n], chunks[0..n], false);
+    defer _ = mlx.mlx_array_free(l);
+    try readReadinessRow(l, got[0 .. n * readiness_vocab]);
+    try src.settle();
+    for (0..n) |k| try expectRowsClose(want[k * readiness_vocab ..][0..readiness_vocab], got[k * readiness_vocab ..][0..readiness_vocab], n);
+}
+
 fn writeReadinessPack(tmp: *testing.TmpDir, path: []u8) ![]const u8 {
     return writeReadinessPackWithEngram(tmp, path, false);
 }
@@ -588,8 +772,9 @@ const SlotReadiness = struct {
         errdefer _ = mlx.mlx_stream_free(s);
         const mp = plugin.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &parsed, .runtime_caps = &runtime_caps, .aux_cache_budget_bytes = cache_bytes, .settings_json = .of("{\"ctx_size\":1024}"), .stream = .{ .ctx = s.ctx } }, &verdict) orelse return error.M2ServedExl3Refused;
         errdefer plugin.table.unload(mp);
-        try testing.expect(runtime_caps.slot_state and !runtime_caps.batches_decode and !runtime_caps.whole_prompt_prefill);
-        try testing.expectEqual(@as(u8, 2), runtime_caps.active_slots);
+        if (@import("../../mlx/device.zig").naxAvailable() and !runtime_caps.slot_state) return error.NaxExl3RetainedStateMissing;
+        try testing.expect(runtime_caps.slot_state and runtime_caps.batches_decode and !runtime_caps.whole_prompt_prefill);
+        try testing.expectEqual(@import("config.zig").stream_active_slots, runtime_caps.active_slots);
         const loaded: *plugin.Model = @ptrCast(@alignCast(mp));
         try testing.expectEqual(@as(u64, @bitCast(runtime_caps)), @as(u64, @bitCast(loaded.caps)));
         parsed.caps = runtime_caps;
@@ -658,6 +843,8 @@ test "deepseek_v41 M2 readiness: two streamed owners share phase changes, cap th
         var interleaved = try SlotReadiness.open(dir);
         defer interleaved.close();
         const m = interleaved.model();
+        // The cap under test: two owners, whatever the device's own limit.
+        m.caps.active_slots = 2;
         const src = m.bank.?.exl3;
         try testing.expect(!plugin.table.cache.aux.?.enabled(interleaved.mp));
         var at: u32 = 0;
@@ -712,6 +899,16 @@ test "deepseek_v41 M2 shared cache: real Engram history survives RAM and codec r
 fn sharedCacheRoundTrip(with_engram: bool) !void {
     if (comptime !build_options.mlx_stream) return requireM2Readiness();
     try requireM2Readiness();
+    return sharedCacheRoundTripImpl(with_engram);
+}
+
+test "deepseek_v41 NAX shared cache: independent histories restore exact Engram and logits" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend() or mlx.virtualGpu() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    try sharedCacheRoundTripImpl(true);
+}
+
+fn sharedCacheRoundTripImpl(with_engram: bool) !void {
     const abi = @import("../../abi/plugin.zig");
     const plugin = @import("plugin.zig");
     const codec = @import("cache_codec.zig");
@@ -843,4 +1040,132 @@ fn sharedCacheRoundTrip(with_engram: bool) !void {
         try testing.expect(live.model().mdl.dec_state == null and live.model().idle == null);
         try testing.expectEqual(@as(usize, 0), live.model().parked.count());
     }
+}
+
+// Real hybrid weights; the driver must hold the GPU lock and enforce memory guards.
+// These tokenized coding histories are shared with the old-engine batch proof.
+const real_batch_prompts = [_][]const u32{
+    &.{ 57266, 411, 46360, 55, 23809, 418, 7768, 22891, 14, 15231, 14, 305, 927, 4131, 16, 6948, 125091, 51432, 16, 23639, 411, 46360, 55, 23809, 418, 7768, 22891, 14, 15231, 14, 305 },
+    &.{ 14965, 305, 11284, 270, 1375, 10531, 13031, 15398, 295, 260, 11680, 5351, 1060, 260, 24216, 2310, 16, 52480, 8499, 362, 11181, 4346, 305, 46588, 3785, 16, 9035, 305, 11284, 270, 1375, 10531, 13031, 15398, 295, 260, 11680, 5351, 1060, 260, 24216, 2310, 16, 52480, 8499, 362, 11181, 4346, 305, 46588, 3785, 16, 9035, 305, 11284, 270, 1375, 10531, 13031, 15398, 295, 260, 11680 },
+    &.{ 21750, 260, 37465, 72177, 7231, 18505, 295, 15255, 16, 59463, 29097, 2231, 7917, 7768, 305, 31698, 2231, 7561, 270, 71087, 16, 15361, 260, 37465, 72177, 7231, 18505, 295, 15255, 16, 59463, 29097, 2231, 7917, 7768, 305, 31698, 2231, 7561, 270, 71087, 16, 15361, 260, 37465, 72177, 7231, 18505, 295, 15255, 16, 59463, 29097, 2231, 7917, 7768, 305, 31698, 2231, 7561, 270, 71087, 16, 15361, 260, 37465, 72177, 7231, 18505, 295, 15255, 16, 59463, 29097, 2231, 7917, 7768, 305, 31698, 2231, 7561, 270, 71087, 16, 15361, 260, 37465, 72177, 7231, 18505, 295, 15255, 16, 59463, 29097, 2231, 7917, 7768, 305, 31698, 2231, 7561, 270, 71087, 16, 15361, 260, 37465, 72177, 7231, 18505, 295, 15255, 16, 59463, 29097, 2231, 7917, 7768, 305, 31698, 2231, 7561, 270, 71087, 16, 15361 },
+    &.{ 19417, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362, 99076, 15, 26, 6555, 14, 22665, 4454, 14, 305, 9132, 37126, 16, 28231, 305, 4678, 270, 19904, 4813, 25320, 16, 6820, 566, 58408, 42952, 362 },
+};
+
+test "deepseek_v41 streamed real batch: full-logit parity for two and four histories" {
+    const dir = std.mem.span(@import("../../env.zig").get(.DSV41_BANK) orelse return error.SkipZigTest);
+    if (!build_options.mlx_stream or mlx.noGpuBackend() or mlx.virtualGpu() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const r = try Resident.open(dir, .{ .act = .bfloat16, .qat = true, .head_8bit = false, .streamed_experts = true });
+    defer r.close();
+    const Exl3 = streamed_w.Exl3;
+    const c = &r.cfg;
+    try testing.expectEqual(@as(usize, 40), r.m.n_layers);
+    try testing.expectEqual(@as(usize, 129280), r.m.vocab);
+    try testing.expectEqual(@as(usize, 2), r.m.engrams.len);
+    const geo: Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(r.m.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
+    const gates = try a.alloc(Exl3.Gate, r.m.n_layers);
+    defer a.free(gates);
+    for (gates, r.m.layers[0..r.m.n_layers]) |*g, *ly| g.* = .{ .w = ly.gate_w, .bias = ly.gate_bias };
+    const src = try Exl3.Source.open(a, testing.io, dir, r.s, geo, gates, .{ .prompt = 64 << 30, .decode = 64 << 30 });
+    defer src.deinit();
+    r.m.streamed = streamed_w.exl3Routed(src);
+    defer r.m.streamed = null;
+    std.debug.print("NATIVE_BATCH_REAL admission prompt={d} decode={d} row_bytes={d}\n", .{ src.bill.rows.prompt, src.bill.rows.decode, src.bill.row_bytes });
+    const vocab = r.m.vocab;
+    const want = try a.alloc(f32, 4 * vocab);
+    defer a.free(want);
+    const got = try a.alloc(f32, 4 * vocab);
+    defer a.free(got);
+    var compared: usize = 0;
+    var mismatched: usize = 0;
+    for ([_]usize{ 2, 4 }) |n| {
+        var serial: [4]dsv41.State = undefined;
+        var grouped: [4]dsv41.State = undefined;
+        var made_serial: usize = 0;
+        var made_grouped: usize = 0;
+        defer for (serial[0..made_serial]) |*st| st.deinit();
+        defer for (grouped[0..made_grouped]) |*st| st.deinit();
+        for (0..n) |k| {
+            serial[k] = try dsv41.initState(r.m, a);
+            made_serial += 1;
+            grouped[k] = try dsv41.initState(r.m, a);
+            made_grouped += 1;
+            for ([_]*dsv41.State{ &serial[k], &grouped[k] }) |st| {
+                const l = try dsv41.extend(r.m, a, st, real_batch_prompts[k], .last);
+                defer _ = mlx.mlx_array_free(l);
+                try readReadinessRow(l, got[0..vocab]);
+                try src.settle();
+            }
+        }
+        var tokens = [_]u32{ 13, 27, 42, 77 };
+        for (0..8) |step| {
+            var ptrs: [4]*dsv41.State = undefined;
+            var chunks: [4][]const u32 = undefined;
+            const gens: [4]u64 = @splat(0);
+            for (0..n) |slot| {
+                const k = if (step % 2 == 0) slot else n - slot - 1;
+                chunks[slot] = tokens[k..][0..1];
+                ptrs[slot] = &grouped[k];
+                const l = try dsv41.extend(r.m, a, &serial[k], chunks[slot], .last);
+                defer _ = mlx.mlx_array_free(l);
+                try readReadinessRow(l, want[slot * vocab ..][0..vocab]);
+                try src.settle();
+            }
+            const calls_before = src.stats().route_calls;
+            const l = try dsv41.extendBatched(r.m, a, ptrs[0..n], gens[0..n], chunks[0..n], false);
+            defer _ = mlx.mlx_array_free(l);
+            try readReadinessRow(l, got[0 .. n * vocab]);
+            try src.settle();
+            try testing.expectEqual(@as(u64, r.m.n_layers), src.stats().route_calls - calls_before);
+            for (0..n) |slot| {
+                const k = if (step % 2 == 0) slot else n - slot - 1;
+                const expected = want[slot * vocab ..][0..vocab];
+                const actual = got[slot * vocab ..][0..vocab];
+                var diffs: usize = 0;
+                var max_abs: f32 = 0;
+                var top: usize = 0;
+                var batch_top: usize = 0;
+                for (expected, actual, 0..) |x, y, j| {
+                    if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) diffs += 1;
+                    max_abs = @max(max_abs, @abs(x - y));
+                    if (x > expected[top]) top = j;
+                    if (y > actual[batch_top]) batch_top = j;
+                }
+                compared += 1;
+                if (diffs > 0) mismatched += 1;
+                std.debug.print("NATIVE_BATCH_REAL_ROW count={d} step={d} lane={d} bit_diffs={d} max_abs={d:.9} serial_top={d} batch_top={d}\n", .{ n, step, k, diffs, max_abs, top, batch_top });
+                try testing.expectEqual(real_batch_prompts[k].len + step + 1, grouped[k].n);
+                try testing.expectEqualSlices(u32, serial[k].hist.items, grouped[k].hist.items);
+                tokens[k] = @intCast(top);
+            }
+        }
+    }
+    std.debug.print("NATIVE_BATCH_REAL_RESULT compared={d} mismatched={d} strict_bit_equal={any}\n", .{ compared, mismatched, mismatched == 0 });
+    try testing.expectEqual(@as(usize, 48), compared);
+    try testing.expectEqual(@as(usize, 0), mismatched);
+}
+
+/// Several histories share each weight read, so their rows match a solo step to kernel numerics (one history: bits).
+/// A history's lone row leaves the one-row kernels for the batch's: on the fixture's random weights that moves a logit
+/// by up to a fifth of the row's scale, and the fixture's flat rows can change argmax (the release weights: greedy
+/// texts part only at near ties).
+fn expectRowsClose(want: []const f32, got: []const f32, histories: usize) !void {
+    if (histories == 1) return testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(got)));
+    var worst: f32 = 0;
+    var scale: f32 = 0;
+    for (want, got) |x, y| {
+        worst = @max(worst, @abs(x - y));
+        scale = @max(scale, @abs(x));
+    }
+    if (worst > 0.3 * @max(scale, 1)) std.debug.print("rows close: worst {d} of scale {d}\n", .{ worst, scale });
+    try testing.expect(worst <= 0.3 * @max(scale, 1));
+    var nan_w: usize = 0;
+    var nan_g: usize = 0;
+    for (want, got) |x, y| {
+        nan_w += @intFromBool(std.math.isNan(x));
+        nan_g += @intFromBool(std.math.isNan(y));
+    }
+    if (nan_w + nan_g > 0) std.debug.print("rows close: NaN want {d} got {d} of {d}; worst {d} scale {d}\n", .{ nan_w, nan_g, want.len, worst, scale });
+    try testing.expectEqual(@as(usize, 0), nan_w + nan_g);
 }

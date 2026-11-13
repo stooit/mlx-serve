@@ -14,7 +14,7 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
 };
 
 pub const model_types = [_][]const u8{"deepseek_v41"};
-pub const stream_active_slots: u8 = 2;
+pub const stream_active_slots: u8 = 4;
 
 pub const claims = sdk.claimsByType(&model_types);
 
@@ -37,13 +37,15 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     return result;
 }
 
-/// Discovery stays single-flight; only the validated portable M2 path opts into interleaved prompt chunks.
-pub fn runtimeCaps(c: *const Config, parsed: abi.Caps, portable_m2: bool) abi.Caps {
+/// Discovery stays single-flight; the load qualifies devices for funded, independently retained states.
+pub fn runtimeCaps(c: *const Config, parsed: abi.Caps, retained_exl3: bool) abi.Caps {
     if (!c.dsv41_exl3_bank) return parsed;
     var caps = parsed;
-    caps.whole_prompt_prefill = !portable_m2;
-    caps.slot_state = portable_m2;
-    caps.active_slots = if (portable_m2) stream_active_slots else 0;
+    caps.whole_prompt_prefill = !retained_exl3;
+    caps.slot_state = retained_exl3;
+    caps.active_slots = if (retained_exl3) stream_active_slots else 0;
+    // Retained states batch their decode and DSpark rounds through the bank's decode lane (`extendBatched`).
+    caps.batches_decode = retained_exl3;
     return caps;
 }
 
@@ -263,7 +265,8 @@ test "deepseek_v41 runtime caps: only portable M2 EXL3 changes discovery policy"
     try testing.expectEqual(@as(u64, @bitCast(p.caps)), @as(u64, @bitCast(legacy)));
     var expected = p.caps;
     expected.slot_state = true;
-    expected.active_slots = 2;
+    expected.active_slots = stream_active_slots;
+    expected.batches_decode = true;
     expected.whole_prompt_prefill = false;
     const m2 = runtimeCaps(of(&p), p.caps, true);
     try testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(m2)));

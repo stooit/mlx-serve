@@ -1,5 +1,6 @@
 //! DSpark rounds: greedy copy and stochastic arms, the Markov-head policy.
 const std = @import("std");
+const log = @import("../../../sdk/util/log.zig");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
@@ -21,6 +22,7 @@ const plugin_settle = @import("../plugin/settle.zig");
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
+const mtp_lookup = @import("mtp_lookup.zig");
 const mtpBatchedAcceptGraph = @import("mtp/batched_graph.zig").mtpBatchedAcceptGraph;
 const mtpSerialOneToken = @import("mtp/serial.zig").mtpSerialOneToken;
 const probsAllPositions = @import("../sampling/spec_sampling.zig").probsAllPositions;
@@ -89,6 +91,10 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
     // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
     if (self.dspark_pol) |*pol| {
+        const xb = dsv41_mod.XBits.get();
+        pol.drafting.max_period = if (xb & dsv41_mod.XBits.backoff_1 != 0) 1 else if (xb & dsv41_mod.XBits.backoff_2 != 0) 2 else if (xb & dsv41_mod.XBits.backoff_4 != 0) 4 else if (xb & dsv41_mod.XBits.backoff_8 != 0) 8 else 32;
+        if (xb & dsv41_mod.XBits.backoff_none != 0) pol.drafting.owed = 0;
+        pol.drafting.near_period = if (xb & dsv41_mod.XBits.backoff_flat != 0) 32 else 2;
         if (!pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
@@ -163,7 +169,9 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
-    const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+    const remaining = self.max_tokens -| self.completion_tokens -| 1;
+    var n = dsparkCopyLen(found, remaining, mdl.ds_block);
+    if (n == 0) n = self.dsparkWeakCopyLen(found, remaining, mdl);
     if (n == 0) return null;
     const ids = try allocator.alloc(u32, n + 1);
     ids[0] = t1;
@@ -179,8 +187,35 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     self.dspark_copies += 1;
     self.dspark_copy_drafted += n;
     self.dspark_copy_accepted += round.accepted;
+    if (self.dspark_pol) |*pol| pol.copy.observe(found.?.suffix, @intCast(n), round.accepted);
     return self.commitDsparkRound(allocator, round, st.n);
 }
+
+/// Drafts a copy round takes from a match short of a quoted span (`dsparkCopyLen` declined it), or 0 for the stage
+/// draft: a streamed bank's rows cost alike and a copy pays no stage forward, so a continuation whose class has been
+/// surviving (`CopyStats`) is taken where it promises more tokens per ms than the stage rounds have been delivering
+/// (the plain step while drafting is backed off). The class forgets, so copies that stop landing stop being taken.
+pub fn dsparkWeakCopyLen(self: *Generator, found: ?mtp_lookup.Match, remaining: u32, mdl: *dsv41_mod.Dsv41Model) usize {
+    const f = found orelse return 0;
+    const pol = if (self.dspark_pol) |*x| x else return 0;
+    if (mdl.streamed == null or f.suffix < WEAK_COPY_SUFFIX or dsv41_mod.XBits.has(dsv41_mod.XBits.weak_copy_off)) return 0;
+    const n = @min(f.draft.len, remaining, dflash_policy.MAX_DRAFTS);
+    if (n == 0) return 0;
+    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+    @memset(p[0..n], pol.copy.probability(f.suffix));
+    const plain = pol.plain.ms;
+    const costs = dflash_policy.linearCosts(0, plain, plain * dflash_policy.GroupCost.streamed.rowShare());
+    const choice = dflash_policy.chooseRows(p[0..n], &costs);
+    if (choice.rows < 2) return 0;
+    const plain_rate = 1 / plain;
+    const stage_rate = if (pol.drafting.wall > 0 and pol.drafting.owed == 0) pol.drafting.gain / plain / pol.drafting.wall else plain_rate;
+    return if (choice.tokens / choice.ms > @max(stage_rate, plain_rate) * WEAK_COPY_MARGIN) choice.rows - 1 else 0;
+}
+
+/// The committed tail a weak copy agrees with at least: the lookup's n-gram and one token before it.
+const WEAK_COPY_SUFFIX: u32 = 5;
+/// A weak copy must promise this much more than what it replaces.
+const WEAK_COPY_MARGIN: f32 = 1.05;
 
 /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
 /// share the round API) and its bookkeeping on the Generator.
@@ -217,12 +252,28 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const t1 = self.next_token_id;
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    const drafted_len = d.len;
+    if (mdl.streamed != null and !dsv41_mod.XBits.has(dsv41_mod.XBits.ladder_rows)) {
+        // A streamed bank's rows cost alike (its group fit's share of the plain step), and the round has paid its draft.
+        const draft_ms = @as(f32, @floatFromInt(mdl.ds_draft_ns)) / @as(f32, std.time.ns_per_ms);
+        const costs = dflash_policy.linearCosts(draft_ms, pol.plain.ms, pol.plain.ms * dflash_policy.GroupCost.streamed.rowShare());
+        d.len = dsparkVerifyDraftsAt(d.confidence[0..d.len], &pol.calib, &costs);
+    } else d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+    if (soloTrace()) {
+        // Before the observations below move the bins: what the policy believed of each draft it verified.
+        var buf: [dflash_policy.MAX_DRAFTS * 6 + 8]u8 = undefined;
+        var w: usize = 0;
+        for (d.confidence[0..d.len]) |c| {
+            const piece = std.fmt.bufPrint(buf[w..], "{d:.2} ", .{pol.calib.probability(sigmoid(c))}) catch break;
+            w += piece.len;
+        }
+        log.info("[solo] drafted={d} verified={d} accepted={d} plain_ms={d:.1} p={s}\n", .{ drafted_len, d.len, round.accepted, pol.plain.ms, buf[0..w] });
+    }
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
@@ -245,6 +296,26 @@ pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.
     for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
     const costs = dflash_policy.priorCosts(plain_ms);
     return dflash_policy.chooseRows(p[0..n], &costs).rows - 1;
+}
+
+fn soloTrace() bool {
+    const T = struct {
+        var read: bool = false;
+        var on: bool = false;
+    };
+    if (!T.read) {
+        T.on = if (env.get(.MLX_SERVE_DSV41_GROUP_TRACE)) |v| v[0] == '1' else false;
+        T.read = true;
+    }
+    return T.on;
+}
+
+/// `dsparkVerifyDrafts` on the caller's round costs.
+pub fn dsparkVerifyDraftsAt(conf_logits: []const f32, calib: *const dflash_policy.Calibration, costs: *const dflash_policy.Costs) usize {
+    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+    const n = @min(conf_logits.len, p.len);
+    for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
+    return dflash_policy.chooseRows(p[0..n], costs).rows - 1;
 }
 
 /// A draft round's bookkeeping; the module stands at `position`.
