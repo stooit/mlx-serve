@@ -94,7 +94,9 @@ const COMPANY_PREFILL_CHUNK: u32 = 2048;
 
 pub fn companyPrefillChunk(chunk: u32, decoding: usize) u32 {
     if (decoding == 0) return chunk;
-    return if (chunk == 0) COMPANY_PREFILL_CHUNK else @min(chunk, COMPANY_PREFILL_CHUNK);
+    // A wider decode-share width (MLX_SERVE_DECODE_SHARE_PREFILL_CHUNK) lifts this cap with it.
+    const cap = @max(COMPANY_PREFILL_CHUNK, decodeSharePrefillChunk());
+    return if (chunk == 0) cap else @min(chunk, cap);
 }
 
 /// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
@@ -134,7 +136,18 @@ pub fn promptLogprobsWidthCap(echo: bool, cap: u32) u32 {
 /// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
 pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
     if (decoding == 0 or share <= 0) return 0;
-    return DECODE_SHARE_PREFILL_CHUNK;
+    return decodeSharePrefillChunk();
+}
+
+var share_chunk_env: ?u32 = null;
+/// `MLX_SERVE_DECODE_SHARE_PREFILL_CHUNK=N` (256 to 16384) in place of `DECODE_SHARE_PREFILL_CHUNK`.
+fn decodeSharePrefillChunk() u32 {
+    if (share_chunk_env == null) {
+        const raw = env.get(.MLX_SERVE_DECODE_SHARE_PREFILL_CHUNK);
+        const v = if (raw) |r| std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
+        share_chunk_env = if (v >= 256 and v <= 16384) v else DECODE_SHARE_PREFILL_CHUNK;
+    }
+    return share_chunk_env.?;
 }
 
 /// Decode wall time owed after a prefill chunk of `chunk_ns`: chunk * S / (1 - S).
